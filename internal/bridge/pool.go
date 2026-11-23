@@ -142,7 +142,7 @@ func (l *Lane) cool(err error) {
 // another lane.
 func (p *Pool) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
 	if opts.ConversationID != "" {
-		if l := p.ownerOf(opts.ConversationID); l != nil {
+		if l := p.ownerOf(normalizeConvID(opts.ConversationID)); l != nil {
 			return l.Bridge.RunTurn(ctx, opts)
 		}
 	}

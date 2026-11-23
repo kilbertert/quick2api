@@ -194,7 +194,7 @@ deliver:
 		} `json:"files"`
 	}
 	if err := json.Unmarshal([]byte(resp.Body), &fin); err != nil {
-		return "", "", fmt.Errorf("deliver body decode: %w", err)
+		return "", "", fmt.Errorf("deliver body decode: %w body=%s", err, trunc(resp.Body, 300))
 	}
 	if fin.Path != "" {
 		return fin.Path, attID, nil

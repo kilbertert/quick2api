@@ -4,6 +4,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -210,6 +211,7 @@ func (b *Bridge) ChatClient() *chat.Client {
 // socket is dropped and redialed once. One retry on a mid-handshake auth
 // failure refreshes the sncs-session and retries on a fresh conn.
 func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
+	opts.ConversationID = normalizeConvID(opts.ConversationID)
 	sess, err := b.Session(false)
 	if err != nil {
 		b.noteErr(err)
@@ -239,6 +241,51 @@ func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnRes
 		return nil, err
 	}
 	return res, nil
+}
+
+// normalizeConvID turns a client-supplied conversation id into one the
+// upstream accepts as session_id. Claude Code passes metadata.user_id as a
+// JSON blob ({"device_id":...,"session_id":"<uuid>"}); the upstream
+// rejects any non-uuid id (invalid_session_id), and the proceed-anyway
+// handshake then leaves files/upload/<id> unregistered — every attachment
+// deliver 404s and oversized prompts degrade to chunked turns. Anything
+// that is not a uuid cannot name a live upstream thread, so drop it.
+func normalizeConvID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if id[0] == '{' {
+		var v struct {
+			SessionID string `json:"session_id"`
+		}
+		if json.Unmarshal([]byte(id), &v) == nil && v.SessionID != "" {
+			id = v.SessionID
+		}
+	}
+	if !looksUUID(id) {
+		return ""
+	}
+	return id
+}
+
+func looksUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i := 0; i < 36; i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // retryable reports whether a Send failure is worth retrying on a fresh
