@@ -10,7 +10,7 @@ func TestRenderTranscript_Simple(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yes"}]}`), &req); err != nil {
 		t.Fatal(err)
 	}
-	text, atts, err := renderTranscript(req.Messages)
+	text, _, atts, err := renderTranscript(req.Messages)
 	if err != nil || text != "User: hi\n\nAssistant: yes" || len(atts) != 0 {
 		t.Fatalf("text=%q atts=%v err=%v", text, atts, err)
 	}
@@ -21,7 +21,7 @@ func TestRenderTranscript_SystemAndDeveloper(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"messages":[{"role":"system","content":"sys"},{"role":"developer","content":"dev"},{"role":"user","content":"u"}]}`), &req); err != nil {
 		t.Fatal(err)
 	}
-	text, _, _ := renderTranscript(req.Messages)
+	text, _, _, _ := renderTranscript(req.Messages)
 	if text != "System: sys\n\nSystem: dev\n\nUser: u" {
 		t.Fatalf("text=%q", text)
 	}
@@ -35,7 +35,7 @@ func TestRenderTranscript_ImageURL(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
 		t.Fatal(err)
 	}
-	_, atts, err := renderTranscript(req.Messages)
+	_, _, atts, err := renderTranscript(req.Messages)
 	if err != nil || len(atts) != 1 {
 		t.Fatalf("atts=%v err=%v", atts, err)
 	}
@@ -52,7 +52,7 @@ func TestRenderTranscript_File(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
 		t.Fatal(err)
 	}
-	_, atts, err := renderTranscript(req.Messages)
+	_, _, atts, err := renderTranscript(req.Messages)
 	if err != nil || len(atts) != 1 || string(atts[0].Data) != "hello" {
 		t.Fatalf("atts=%v err=%v", atts, err)
 	}

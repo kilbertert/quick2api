@@ -72,20 +72,37 @@ func (c *Client) sendPrompt(ctx context.Context, t *turn, conversationID string,
 	// 3. Oversized text — try the out-of-band path first (one model turn
 	// instead of N); fall back to sequential primed chunks when the upload
 	// channel can't deliver.
+	//
+	// The attachment must carry CONTEXT ONLY: when the whole transcript —
+	// including the operative last message — goes into the file, the model
+	// answers as a document analyst ("this file contains a Claude Code
+	// session…") instead of executing the request. Keep the final message
+	// inline so the model sees a real user turn; earlier context rides the
+	// file. Final=="" (or Final alone exceeding the inline limit) degrades
+	// to the legacy everything-in-one-file shape.
 	if sess != nil && sess.TenantURL != "" && sess.IDToken != "" {
-		path, attID, err := uploadAttachment(ctx, sess, conversationID, "prompt.txt", []byte(opts.Text))
+		ctxData, ctxName, inline := []byte(opts.Text), "prompt.txt",
+			"The full prompt is in the attached file prompt.txt. Respond to the last user message in it — earlier content is context, not a file to summarize."
+		if opts.Final != "" && strings.HasSuffix(opts.Text, opts.Final) {
+			if ctx := strings.TrimSpace(opts.Text[:len(opts.Text)-len(opts.Final)]); ctx != "" {
+				candidate := "Earlier conversation context is in the attached file context.txt — treat it as history you already read. Respond directly to this new message:\n\n" + opts.Final
+				if len(candidate) <= maxSingleText {
+					ctxData, ctxName, inline = []byte(ctx), "context.txt", candidate
+				}
+			}
+		}
+		path, attID, err := uploadAttachment(ctx, sess, conversationID, ctxName, ctxData)
 		slog.Debug("sendPrompt upload attempt", "path", path, "attID", attID, "err", err)
 		if err == nil && path != "" {
 			wireAtts = append(wireAtts, map[string]any{
 				"type":         "file",
-				"name":         "prompt.txt",
-				"size":         len(opts.Text),
+				"name":         ctxName,
+				"size":         len(ctxData),
 				"mimeType":     "text/plain",
 				"path":         path,
 				"attachmentId": attID,
 			})
-			short := "The full prompt is in the attached file prompt.txt. Read it and respond to it."
-			if err := sendUserMessage(t, conversationID, short, opts, wireAtts); err != nil {
+			if err := sendUserMessage(t, conversationID, inline, opts, wireAtts); err != nil {
 				return nil, err
 			}
 			res, err := t.collect(ctx, &TurnResult{FinishReason: "stop"})

@@ -80,6 +80,11 @@ type TurnOpts struct {
 	// on the stateful thread. Any mismatch falls back to full Text, so a
 	// bad delta decision never does worse than today's retransmission.
 	Tail string
+	// Final is the rendered last message of the transcript ("User: ...",
+	// "ToolResult: ..." — the operative instruction). The oversized-prompt
+	// path keeps it inline in the user_message so the model answers a real
+	// turn instead of analyzing an uploaded transcript document.
+	Final string
 	// OnEvent is invoked synchronously from the read loop; implementations
 	// should be fast or hand off to a channel.
 	OnEvent func(TurnEvent)

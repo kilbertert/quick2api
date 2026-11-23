@@ -140,10 +140,14 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "n>1 unsupported: Quick runs one turn per request", "")
 		return
 	}
-	text, atts, err := renderTranscript(req.Messages)
+	text, lastMsgAt, atts, err := renderTranscript(req.Messages)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
 		return
+	}
+	var final string
+	if lastMsgAt < len(text) {
+		final = text[lastMsgAt:]
 	}
 	// tools → same instruction contract the Anthropic adapter emits so the
 	// upstream model sees one protocol regardless of which surface the
@@ -198,11 +202,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	clientTools := clientHasTools(req.Tools)
 	exec := h.execFor(clientTools)
 	if req.Stream {
-		h.stream(w, r, ctx, reqID, model, agentMode, thinking, text, tail, atts,
+		h.stream(w, r, ctx, reqID, model, agentMode, thinking, text, tail, final, atts,
 			conversationID, exec, clientTools, dlogDir)
 		return
 	}
-	h.complete(w, r, ctx, reqID, model, agentMode, thinking, text, tail, atts,
+	h.complete(w, r, ctx, reqID, model, agentMode, thinking, text, tail, final, atts,
 		conversationID, exec, dlogDir)
 }
 
@@ -232,11 +236,11 @@ func (h *Handler) execFor(clientTools bool) bool {
 
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	reqID, model, agentMode, thinking, text, tail string,
+	reqID, model, agentMode, thinking, text, tail, final string,
 	atts []chat.Attachment, conversationID string, exec bool, dlogDir string) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, atts,
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, final, atts,
 		conversationID, exec, frames, nil, nil)
 	frames.Write(h.Debug, dlogDir)
 	if err != nil {
@@ -274,7 +278,7 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.C
 // enabled and the reply parses as a tool call, execute it locally and
 // feed the result back until the model stops calling tools.
 func (h *Handler) runAgent(ctx context.Context,
-	reqID, agentMode, thinking, text, tail string,
+	reqID, agentMode, thinking, text, tail, final string,
 	atts []chat.Attachment, conversationID string, exec bool,
 	frames *common.Frames, onDelta func(string),
 	onToolRound func(round int, calls []common.ToolCallJSON)) (*chat.TurnResult, error) {
@@ -293,13 +297,14 @@ func (h *Handler) runAgent(ctx context.Context,
 	for round := 0; round < maxRounds; round++ {
 		// Only round 0 is a full client transcript — later rounds send
 		// server-generated tool results, which are appends, not state.
-		var roundTail string
+		var roundTail, roundFinal string
 		if round == 0 {
-			roundTail = tail
+			roundTail, roundFinal = tail, final
 		}
 		res, err = h.Bridge.RunTurn(ctx, chat.TurnOpts{
 			Text:           prompt,
 			Tail:           roundTail,
+			Final:          roundFinal,
 			AgentMode:      agentMode,
 			ThinkingEffort: thinking,
 			UserTimezone:   h.Cfg.Quick.UserTimezone,
@@ -379,7 +384,7 @@ func openAIToolCalls(calls []common.ToolCallJSON) []ToolCall {
 // stream handles the SSE path. Each tool round emits a `quick2api_tool`
 // chunk-shaped event; the final round's text arrives as one delta.
 func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	reqID, model, agentMode, thinking, text, tail string,
+	reqID, model, agentMode, thinking, text, tail, final string,
 	atts []chat.Attachment, conversationID string, exec, clientTools bool, dlogDir string) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -416,7 +421,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	liveDeltas := !exec && !clientTools
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, atts,
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, final, atts,
 		conversationID, exec, frames,
 		func(delta string) {
 			if liveDeltas {
@@ -537,9 +542,11 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 // renderTranscript flattens OpenAI messages into the single text the
 // upstream user_message carries, plus any binary parts (image_url/file)
 // converted to chat.Attachment for the out-of-band upload path.
-func renderTranscript(msgs []Message) (text string, atts []chat.Attachment, err error) {
+func renderTranscript(msgs []Message) (text string, lastMsgAt int, atts []chat.Attachment, err error) {
 	var b strings.Builder
+	lastMsgAt = 0
 	for _, m := range msgs {
+		msgStart := b.Len()
 		// assistant tool_calls → render into transcript so the model sees
 		// its own history.
 		for _, tc := range m.ToolCalls {
@@ -547,7 +554,7 @@ func renderTranscript(msgs []Message) (text string, atts []chat.Attachment, err 
 		}
 		content, mAtts, err := flattenContent(m.Content)
 		if err != nil {
-			return "", nil, fmt.Errorf("%s message: %w", m.Role, err)
+			return "", 0, nil, fmt.Errorf("%s message: %w", m.Role, err)
 		}
 		atts = append(atts, mAtts...)
 		if content == "" && len(m.ToolCalls) == 0 && len(mAtts) == 0 {
@@ -569,12 +576,15 @@ func renderTranscript(msgs []Message) (text string, atts []chat.Attachment, err 
 		if content != "" {
 			fmt.Fprintf(&b, "%s: %s\n\n", label, content)
 		}
+		if b.Len() > msgStart {
+			lastMsgAt = msgStart
+		}
 	}
 	out := strings.TrimSpace(b.String())
 	if out == "" && len(atts) == 0 {
-		return "", nil, errors.New("messages rendered to empty text")
+		return "", 0, nil, errors.New("messages rendered to empty text")
 	}
-	return out, atts, nil
+	return out, lastMsgAt, atts, nil
 }
 
 // flattenContent accepts either a string or an array of content parts.
