@@ -116,7 +116,7 @@ func (h *Handler) CountTokens(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error())
 		return
 	}
-	text, _, err := renderPrompt(&req)
+	text, _, _, err := renderPrompt(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -144,10 +144,14 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	text, atts, err := renderPrompt(&req)
+	text, tailAt, atts, err := renderPrompt(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
+	}
+	var tail string
+	if tailAt < len(text) {
+		tail = text[tailAt:]
 	}
 
 	release, ok := common.Acquire(r.Context(), h.Sem)
@@ -193,10 +197,10 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 	clientTools := clientHasTools(req.Tools)
 	exec := h.execFor(clientTools)
 	if req.Stream {
-		h.stream(w, ctx, reqID, model, agentMode, thinking, text, atts, conversationID, exec, clientTools, dlogDir)
+		h.stream(w, ctx, reqID, model, agentMode, thinking, text, tail, atts, conversationID, exec, clientTools, dlogDir)
 		return
 	}
-	h.complete(w, ctx, reqID, model, agentMode, thinking, text, atts, conversationID, exec, dlogDir)
+	h.complete(w, ctx, reqID, model, agentMode, thinking, text, tail, atts, conversationID, exec, dlogDir)
 }
 
 // clientHasTools reports whether the client declared its own tool
@@ -235,11 +239,11 @@ func conversationIDOf(r *http.Request, req *MessagesRequest) string {
 
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
-	reqID, model, agentMode, thinking, text string,
+	reqID, model, agentMode, thinking, text, tail string,
 	atts []chat.Attachment, conversationID string, exec bool, dlogDir string) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, atts,
 		conversationID, exec, frames, nil, nil)
 	// Always write frames before returning — the error path is exactly
 	// where they are needed to see the upstream's real error payload.
@@ -302,7 +306,7 @@ func (h *Handler) execFor(clientTools bool) bool {
 // tool calls — streaming callers use it to emit progress events instead
 // of the raw tool JSON.
 func (h *Handler) runAgent(ctx context.Context,
-	reqID, agentMode, thinking, text string,
+	reqID, agentMode, thinking, text, tail string,
 	atts []chat.Attachment, conversationID string, exec bool,
 	frames *common.Frames, onDelta func(string),
 	onToolRound func(round int, calls []common.ToolCallJSON)) (*chat.TurnResult, error) {
@@ -319,8 +323,15 @@ func (h *Handler) runAgent(ctx context.Context,
 	var res *chat.TurnResult
 	var err error
 	for round := 0; round < maxRounds; round++ {
+		// Only round 0 is a full client transcript — later rounds send
+		// server-generated tool results, which are appends, not state.
+		var roundTail string
+		if round == 0 {
+			roundTail = tail
+		}
 		res, err = h.Bridge.RunTurn(ctx, chat.TurnOpts{
 			Text:           prompt,
+			Tail:           roundTail,
 			AgentMode:      agentMode,
 			ThinkingEffort: thinking,
 			UserTimezone:   h.Cfg.Quick.UserTimezone,
@@ -374,7 +385,7 @@ func (h *Handler) runAgent(ctx context.Context,
 // whole); each completed tool round emits a `quick2api_tool` progress
 // event, and the final non-tool round's text is emitted as one delta.
 func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
-	reqID, model, agentMode, thinking, text string,
+	reqID, model, agentMode, thinking, text, tail string,
 	atts []chat.Attachment, conversationID string, exec, clientTools bool, dlogDir string) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -425,7 +436,7 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	liveDeltas := !exec && !clientTools
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, atts,
 		conversationID, exec, frames,
 		func(delta string) {
 			if liveDeltas {
@@ -538,7 +549,11 @@ func (h *Handler) finishDebug(dir string, out any, runErr error) {
 // callers that run a real tool loop (executor) still want the schemas in
 // the prompt, callers that just pass the advisory contract through prefer
 // to keep them anyway; both produce identical rendered text today.
-func renderPrompt(req *MessagesRequest) (text string, atts []chat.Attachment, err error) {
+// tailAt is the byte offset inside the returned text where the rendered
+// message history begins — everything before it is the request preamble
+// (system prompt + tools instruction). Callers use text[tailAt:] as the
+// delta-eligible Tail so preamble drift never poisons the prefix check.
+func renderPrompt(req *MessagesRequest) (text string, tailAt int, atts []chat.Attachment, err error) {
 	var b strings.Builder
 
 	// system: string | [ {type:"text",text:…} ]
@@ -565,6 +580,9 @@ func renderPrompt(req *MessagesRequest) (text string, atts []chat.Attachment, er
 		b.WriteString(ins)
 	}
 
+	// The builder's head writes never start with whitespace, so this offset
+	// stays valid after the final TrimSpace.
+	tailAt = b.Len()
 	for _, m := range req.Messages {
 		// content: string | [ blocks ]
 		var s string
@@ -580,7 +598,7 @@ func renderPrompt(req *MessagesRequest) (text string, atts []chat.Attachment, er
 		}
 		var blocks []ContentBlock
 		if err := json.Unmarshal(m.Content, &blocks); err != nil {
-			return "", nil, fmt.Errorf("%s message: content must be a string or blocks", m.Role)
+			return "", 0, nil, fmt.Errorf("%s message: content must be a string or blocks", m.Role)
 		}
 		for _, bl := range blocks {
 			switch bl.Type {
@@ -593,7 +611,7 @@ func renderPrompt(req *MessagesRequest) (text string, atts []chat.Attachment, er
 			case "image":
 				a, aerr := attachmentFromImageBlock(&bl)
 				if aerr != nil {
-					return "", nil, fmt.Errorf("image block: %w", aerr)
+					return "", 0, nil, fmt.Errorf("image block: %w", aerr)
 				}
 				if a != nil {
 					atts = append(atts, *a)
@@ -601,7 +619,7 @@ func renderPrompt(req *MessagesRequest) (text string, atts []chat.Attachment, er
 			case "document":
 				a, aerr := attachmentFromDocumentBlock(&bl)
 				if aerr != nil {
-					return "", nil, fmt.Errorf("document block: %w", aerr)
+					return "", 0, nil, fmt.Errorf("document block: %w", aerr)
 				}
 				if a != nil {
 					atts = append(atts, *a)
@@ -638,9 +656,9 @@ func renderPrompt(req *MessagesRequest) (text string, atts []chat.Attachment, er
 
 	out := strings.TrimSpace(b.String())
 	if out == "" && len(atts) == 0 {
-		return "", nil, errors.New("messages rendered to empty text")
+		return "", 0, nil, errors.New("messages rendered to empty text")
 	}
-	return out, atts, nil
+	return out, tailAt, atts, nil
 }
 
 // attachmentFromImageBlock converts an Anthropic `image` content block

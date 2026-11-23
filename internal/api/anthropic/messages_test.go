@@ -16,7 +16,7 @@ func req(t *testing.T, body string) *MessagesRequest {
 
 func TestRenderPrompt_Plain(t *testing.T) {
 	r := req(t, `{"messages":[{"role":"user","content":"hi"}]}`)
-	text, atts, err := renderPrompt(r)
+	text, _, atts, err := renderPrompt(r)
 	if err != nil || text != "User: hi" || len(atts) != 0 {
 		t.Fatalf("text=%q atts=%v err=%v", text, atts, err)
 	}
@@ -24,7 +24,7 @@ func TestRenderPrompt_Plain(t *testing.T) {
 
 func TestRenderPrompt_System(t *testing.T) {
 	r := req(t, `{"system":"be terse","messages":[{"role":"user","content":"hi"}]}`)
-	text, _, _ := renderPrompt(r)
+	text, _, _, _ := renderPrompt(r)
 	if text != "System: be terse\n\nUser: hi" {
 		t.Fatalf("text=%q", text)
 	}
@@ -32,7 +32,7 @@ func TestRenderPrompt_System(t *testing.T) {
 
 func TestRenderPrompt_Assistant(t *testing.T) {
 	r := req(t, `{"messages":[{"role":"assistant","content":"yes"}]}`)
-	text, _, _ := renderPrompt(r)
+	text, _, _, _ := renderPrompt(r)
 	if text != "Assistant: yes" {
 		t.Fatalf("text=%q", text)
 	}
@@ -42,7 +42,7 @@ func TestRenderPrompt_ImageBase64(t *testing.T) {
 	png := "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
 	body := `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + png + `"}}]}]}`
 	r := req(t, body)
-	_, atts, err := renderPrompt(r)
+	_, _, atts, err := renderPrompt(r)
 	if err != nil || len(atts) != 1 {
 		t.Fatalf("atts=%v err=%v", atts, err)
 	}
@@ -53,7 +53,7 @@ func TestRenderPrompt_ImageBase64(t *testing.T) {
 
 func TestRenderPrompt_ToolUse(t *testing.T) {
 	r := req(t, `{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"x","name":"Bash","input":{"c":"ls"}}]}]}`)
-	text, _, _ := renderPrompt(r)
+	text, _, _, _ := renderPrompt(r)
 	if text != `ToolUse Bash({"c":"ls"})` {
 		t.Fatalf("text=%q", text)
 	}

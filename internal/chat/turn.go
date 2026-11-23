@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -172,6 +173,12 @@ type Conn struct {
 	// dead flips when the read pump exits — after that the socket is gone
 	// and the next Send would write into a closing channel.
 	dead atomic.Bool
+
+	// sentTail is the shadow transcript: the message-history tail this
+	// conn's upstream thread already carries. It lives on the Conn because
+	// its validity ends with the thread — a dropped conn reseeds on the
+	// next Send. Serial per-conn Sends keep it race-free.
+	sentTail string
 }
 
 // NewConversation dials and handshakes a persistent upstream conversation.
@@ -239,12 +246,39 @@ func (cn *Conn) Send(ctx context.Context, sess *session.Session, opts TurnOpts) 
 			opts.OnEvent(ev)
 		}
 	}
+	send, commit := deltaTail(cn.sentTail, opts.Text, opts.Tail)
+	if send != opts.Text {
+		slog.Info("delta turn", "send_bytes", len(send), "tail_bytes", len(opts.Tail))
+	}
+	opts.Text = send
 	res, err := cn.c.sendPrompt(ctx, cn.t, cn.convID, opts, sess)
+	if err == nil {
+		cn.sentTail = commit
+	}
 	if err != nil && !cn.Alive() {
 		// Connection died mid-turn — mark it so the pool drops it.
 		cn.dead.Store(true)
 	}
 	return res, err
+}
+
+// deltaTail decides what a Send actually puts on the wire. sentTail is the
+// watermark already appended to this thread; tail is the request's
+// rendered history tail ("" = caller supplied no split info → send Text).
+// When the new tail is an append-only continuation of the shadow, only the
+// unsent suffix goes upstream. On a failed turn the watermark is not
+// committed, so the next request re-derives the delta from the last good
+// state (a bounded duplicate at worst).
+func deltaTail(sentTail, text, tail string) (send, commit string) {
+	if tail == "" {
+		return text, sentTail
+	}
+	if sentTail != "" && strings.HasPrefix(tail, sentTail) {
+		if delta := strings.TrimLeft(tail[len(sentTail):], "\n"); delta != "" {
+			return delta, tail
+		}
+	}
+	return text, tail
 }
 
 // RunTurn performs one complete turn on a fresh WebSocket connection and

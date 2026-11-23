@@ -72,6 +72,14 @@ type TurnOpts struct {
 	// path uploads them via uploadAttachment and wires the returned
 	// server path into payload.attachments.
 	Attachments []Attachment
+	// Tail is the rendered message-history portion of Text (Text's suffix
+	// after the request preamble; "" disables delta turns). A pooled Conn
+	// keeps the tail it last sent as a shadow transcript — when this
+	// request's Tail continues that shadow, only the unsent suffix goes
+	// upstream: the stateless-API full transcript becomes a delta-append
+	// on the stateful thread. Any mismatch falls back to full Text, so a
+	// bad delta decision never does worse than today's retransmission.
+	Tail string
 	// OnEvent is invoked synchronously from the read loop; implementations
 	// should be fast or hand off to a channel.
 	OnEvent func(TurnEvent)

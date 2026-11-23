@@ -76,3 +76,29 @@ func TestSplitText_Runes(t *testing.T) {
 		t.Fatalf("roundtrip lost data")
 	}
 }
+
+func TestDeltaTail(t *testing.T) {
+	// No Tail: caller gave no split info — always send Text, keep shadow.
+	if send, commit := deltaTail("old", "full", ""); send != "full" || commit != "old" {
+		t.Fatalf("no-tail: %q %q", send, commit)
+	}
+	// First sighting: send the full Text, commit the tail as watermark.
+	if send, commit := deltaTail("", "full", "User: a"); send != "full" || commit != "User: a" {
+		t.Fatalf("first: %q %q", send, commit)
+	}
+	// Append-only continuation: send just the unsent suffix.
+	send, commit := deltaTail("User: a\n\nAssistant: b\n\n",
+		"HEAD User: a\n\nAssistant: b\n\nUser: c",
+		"User: a\n\nAssistant: b\n\nUser: c")
+	if send != "User: c" || commit != "User: a\n\nAssistant: b\n\nUser: c" {
+		t.Fatalf("delta: %q %q", send, commit)
+	}
+	// Divergence (edited/compacted history): full resend, commit new tail.
+	if send, commit := deltaTail("User: a", "full2", "User: x"); send != "full2" || commit != "User: x" {
+		t.Fatalf("diverge: %q %q", send, commit)
+	}
+	// Identical tail (nothing new): full resend, no delta empty send.
+	if send, commit := deltaTail("User: a", "full3", "User: a"); send != "full3" || commit != "User: a" {
+		t.Fatalf("same: %q %q", send, commit)
+	}
+}

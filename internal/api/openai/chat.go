@@ -151,6 +151,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if ins := common.ToolsInstruction(req.Tools); ins != "" {
 		text = ins + text
 	}
+	// The whole transcript is the delta-eligible tail: OpenAI messages mix
+	// roles inline, so system/developer lines are history content too.
+	tail := text
 	conversationID := strings.TrimSpace(req.ConversationID)
 	if conversationID == "" {
 		conversationID = strings.TrimSpace(r.Header.Get("X-Conversation-Id"))
@@ -195,11 +198,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	clientTools := clientHasTools(req.Tools)
 	exec := h.execFor(clientTools)
 	if req.Stream {
-		h.stream(w, r, ctx, reqID, model, agentMode, thinking, text, atts,
+		h.stream(w, r, ctx, reqID, model, agentMode, thinking, text, tail, atts,
 			conversationID, exec, clientTools, dlogDir)
 		return
 	}
-	h.complete(w, r, ctx, reqID, model, agentMode, thinking, text, atts,
+	h.complete(w, r, ctx, reqID, model, agentMode, thinking, text, tail, atts,
 		conversationID, exec, dlogDir)
 }
 
@@ -229,11 +232,11 @@ func (h *Handler) execFor(clientTools bool) bool {
 
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	reqID, model, agentMode, thinking, text string,
+	reqID, model, agentMode, thinking, text, tail string,
 	atts []chat.Attachment, conversationID string, exec bool, dlogDir string) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, atts,
 		conversationID, exec, frames, nil, nil)
 	frames.Write(h.Debug, dlogDir)
 	if err != nil {
@@ -271,7 +274,7 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.C
 // enabled and the reply parses as a tool call, execute it locally and
 // feed the result back until the model stops calling tools.
 func (h *Handler) runAgent(ctx context.Context,
-	reqID, agentMode, thinking, text string,
+	reqID, agentMode, thinking, text, tail string,
 	atts []chat.Attachment, conversationID string, exec bool,
 	frames *common.Frames, onDelta func(string),
 	onToolRound func(round int, calls []common.ToolCallJSON)) (*chat.TurnResult, error) {
@@ -288,8 +291,15 @@ func (h *Handler) runAgent(ctx context.Context,
 	var res *chat.TurnResult
 	var err error
 	for round := 0; round < maxRounds; round++ {
+		// Only round 0 is a full client transcript — later rounds send
+		// server-generated tool results, which are appends, not state.
+		var roundTail string
+		if round == 0 {
+			roundTail = tail
+		}
 		res, err = h.Bridge.RunTurn(ctx, chat.TurnOpts{
 			Text:           prompt,
+			Tail:           roundTail,
 			AgentMode:      agentMode,
 			ThinkingEffort: thinking,
 			UserTimezone:   h.Cfg.Quick.UserTimezone,
@@ -369,7 +379,7 @@ func openAIToolCalls(calls []common.ToolCallJSON) []ToolCall {
 // stream handles the SSE path. Each tool round emits a `quick2api_tool`
 // chunk-shaped event; the final round's text arrives as one delta.
 func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Context,
-	reqID, model, agentMode, thinking, text string,
+	reqID, model, agentMode, thinking, text, tail string,
 	atts []chat.Attachment, conversationID string, exec, clientTools bool, dlogDir string) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -406,7 +416,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	liveDeltas := !exec && !clientTools
 
 	frames := common.NewFrames(h.Debug.LogFrames)
-	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, atts,
+	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, atts,
 		conversationID, exec, frames,
 		func(delta string) {
 			if liveDeltas {
