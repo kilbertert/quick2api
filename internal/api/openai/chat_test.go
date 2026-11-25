@@ -3,7 +3,30 @@ package openai
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/kilbertert/quick2api/internal/chat"
 )
+
+func TestMessageOutAfterNativeToolProgress(t *testing.T) {
+	const progress = "I'll read the attached context first."
+	const toolJSON = `{"type":"tool_use","id":"toolu_test","name":"Bash","input":{"command":"echo TOOL_BOUNDARY_OK"}}`
+	res := &chat.TurnResult{Text: progress + toolJSON, ToolTextOffset: len(progress), FinishReason: "stop"}
+	msg := messageOutForResult(res)
+	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Function.Name != "Bash" || msg.ToolCalls[0].Function.Arguments != `{"command":"echo TOOL_BOUNDARY_OK"}` {
+		t.Fatalf("native progress hid client tool invocation: %+v", msg)
+	}
+	res.FinishReason = "content_filter"
+	msg = messageOutForResult(res)
+	if len(msg.ToolCalls) != 0 || msg.Content != res.Text {
+		t.Fatalf("blocked reply became a tool invocation: %+v", msg)
+	}
+	res.FinishReason = "stop"
+	res.PartialOnClose = true
+	msg = messageOutForResult(res)
+	if len(msg.ToolCalls) != 0 || msg.Content != res.Text {
+		t.Fatalf("incomplete reply became a tool invocation: %+v", msg)
+	}
+}
 
 func TestRenderTranscript_Simple(t *testing.T) {
 	var req ChatRequest

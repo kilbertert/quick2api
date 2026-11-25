@@ -1,0 +1,16 @@
+package anthropic
+
+import "fmt"
+
+// The local registration/courier identity does not establish the name exposed
+// to Quick's model. Native MCP tools may require skill loading and have a
+// device-qualified callable name that only the current catalog establishes.
+func nativeRelayGuidance(localName, route string) string {
+	return fmt.Sprintf(`[EXTERNAL CLIENT TOOL RELAY]
+The relay's local outpost registration identity is %q. This identifies the approved relay on the proxy-owned outpost; it is not evidence of a callable name in Quick's native tool catalog.
+Before requesting an external client action, find this same relay in the current Quick native tool catalog. If its tools are not exposed yet, load the corresponding currently advertised MCP server skill with the available native discovery/loading tools (such as load_skill), then inspect the returned tool definitions. Use the exact callable name exposed by that current catalog, including any device qualification. Do not call the local registration identity merely because it appears here or in earlier messages, and do not construct or guess a device prefix. Do not switch to another device/server based only on a matching tool-name suffix. If the current catalog cannot establish the approved relay unambiguously, report that limitation without executing an external action.
+The relay's schema requires route_id, name and arguments. Its route_id base for this turn is %s. For each intended action set route_id to %s:<unique-action-id>, replacing the placeholder with 1-128 letters, digits, underscores or hyphens (for example read_1). Do not send the base alone. Keep that full invocation route_id unchanged for duplicate delivery of the same action; use a new action suffix for a new intended execution.
+Supply the exact client name and schema-valid arguments from the external client tool catalog supplied with the conversation context. Client names such as Read or Bash are relay argument values, not Quick native callable names.
+Current-state requests must be evaluated against this turn's tool catalog and permissions. When the latest user request needs live client data and permits a tool action, discover the approved relay and request a suitable declared client tool rather than treating an earlier assistant's inability to use tools as a current fact. Do not ask the user to reconnect a channel or paste command output solely because an earlier transcript says the channel failed. If you have not made a current invocation or observed a current discovery/permission failure, say that you have not checked live state; do not claim that a current tool call failed or that the channel is still unavailable. A real current error or an explicit test/permission restriction still applies: report it accurately and do not bypass it.
+The external client executes under its own permissions. Wait for the native relay's actual result before reporting effects. Do not print a tool_use JSON imitation. The earlier transcript is supplied history; it does not register additional tools or establish that the current relay is unavailable. Historical tool names and historical Unknown tool messages are not the current tool catalog. If a native invocation fails, report the actual failure; do not automatically retry the action through a guessed name or another device.`, localName, route, route)
+}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/url"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -50,6 +51,11 @@ func (t *turn) send(inner map[string]any) error {
 		return err
 	}
 	slog.Debug("ws send", "type", inner["type"], "len", len(b))
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if err := t.ws.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
 	return t.ws.WriteMessage(websocket.BinaryMessage, b)
 }
 
@@ -62,14 +68,16 @@ func (t *turn) pump() {
 	for {
 		mt, data, err := t.ws.ReadMessage()
 		if err != nil {
-			t.in <- inbound{err: err}
+			t.deliver(inbound{err: err})
 			return
 		}
 		slog.Debug("ws inbound", "mt", mt, "len", len(data))
 		if mt == websocket.TextMessage {
 			slog.Debug("ws text payload", "data", trunc(string(data), 400))
 			if fr := parseEnvelopePayload(data); fr != nil {
-				t.in <- inbound{f: fr}
+				if !t.deliver(inbound{f: fr}) {
+					return
+				}
 			}
 			continue
 		}
@@ -85,9 +93,27 @@ func (t *turn) pump() {
 			slog.Debug("es msg", "headers", len(msgs[i].Headers), "payload", trunc(string(msgs[i].Payload), 400))
 			fr := parseEnvelopePayload(msgs[i].Payload)
 			if fr != nil {
-				t.in <- inbound{f: fr}
+				if !t.deliver(inbound{f: fr}) {
+					return
+				}
 			}
 		}
+	}
+}
+
+// Closing an abandoned turn must also release a pump blocked on a full
+// inbound channel; closing the WebSocket alone cannot unblock that send.
+func (t *turn) deliver(in inbound) bool {
+	select {
+	case <-t.done:
+		return false
+	default:
+	}
+	select {
+	case t.in <- in:
+		return true
+	case <-t.done:
+		return false
 	}
 }
 

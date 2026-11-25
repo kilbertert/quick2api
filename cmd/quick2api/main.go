@@ -115,6 +115,7 @@ func main() {
 	}
 
 	a := app.New(cfg, b, dlog)
+	defer a.Close()
 	srv := &http.Server{
 		Addr:              cfg.Server.Listen,
 		Handler:           a.Mux,
@@ -126,6 +127,7 @@ func main() {
 	}
 	go func() {
 		<-ctx.Done()
+		a.Close()
 		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shCtx)

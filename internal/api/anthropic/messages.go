@@ -7,14 +7,15 @@
 //
 // Scope: the text surface only. Client-declared tools are flattened
 // into a leading instruction block (the upstream agent sees their
-// schemas as text); tool_use content blocks in the request are
-// rendered as "ToolUse <name>(<json>)" so history stays coherent.
+// schemas as text); historical tool calls and results are rendered as
+// JSON envelopes retaining their correlation IDs and content blocks.
 // Stop sequences and max_tokens are passed positionally but the
 // upstream turn doesn't honor them server-side — they're metadata.
 package anthropic
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -39,6 +40,7 @@ type Handler struct {
 	Cfg    *config.Config
 	Debug  *debuglog.Logger
 	Sem    chan struct{}
+	Native *NativeBridge
 	// Tools is the server-side executor registry; nil = advisory mode
 	// (schemas go in the prompt, tool_use blocks come back as-is).
 	// *Registry over Executor so execFor can ask Has() for auto-mode
@@ -112,17 +114,28 @@ func (h *Handler) CountTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req MessagesRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error())
+	if err := common.DecodeRequestBody(w, r, &req, h.Cfg.RequestBodyLimit()); err != nil {
+		status, kind, message := common.RequestBodyError(err)
+		writeErr(w, status, kind, message)
 		return
 	}
-	text, _, _, _, err := renderPrompt(&req)
+	render := renderPrompt
+	if h.Native != nil {
+		render = renderNativePrompt
+	}
+	text, _, _, atts, err := render(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	bytes := len(text)
+	for _, att := range atts {
+		if strings.HasPrefix(att.MimeType, "text/") || att.MimeType == "application/json" {
+			bytes += len(att.Data)
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": len(text) / 4})
+	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": bytes / 4})
 }
 
 // ---------- endpoint ----------
@@ -135,8 +148,9 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req MessagesRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error())
+	if err := common.DecodeRequestBody(w, r, &req, h.Cfg.RequestBodyLimit()); err != nil {
+		status, kind, message := common.RequestBodyError(err)
+		writeErr(w, status, kind, message)
 		return
 	}
 	if len(req.Messages) == 0 {
@@ -144,7 +158,11 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	text, tailAt, lastMsgAt, atts, err := renderPrompt(&req)
+	render := renderPrompt
+	if h.Native != nil {
+		render = renderNativePrompt
+	}
+	text, tailAt, lastMsgAt, atts, err := render(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -186,30 +204,53 @@ func (h *Handler) Messages(w http.ResponseWriter, r *http.Request) {
 	// first message's client-supplied id). Falls back to a fresh conv each
 	// request — the bridge drops stale conns automatically.
 	conversationID := conversationIDOf(r, &req)
+	if h.Native != nil {
+		req.Model = model
+		h.serveNative(w, r, reqID, model, conversationID, text, tail, final, atts, &req)
+		return
+	}
+	clientTools := clientHasTools(req.Tools)
+	toolCount := clientToolCount(req.Tools)
 
 	dlogDir := h.Debug.Dir(reqID)
 	h.Debug.Write(dlogDir, "00-request", map[string]any{
 		"id": reqID, "model": model, "agent_mode": agentMode,
 		"stream": req.Stream, "messages": len(req.Messages),
 		"conversation": conversationID,
+		"system_bytes": len(req.System), "tools_bytes": len(req.Tools),
+		"tool_count": toolCount, "rendered_bytes": len(text),
+		"tail_bytes": len(tail), "final_bytes": len(final),
+		"client_tools": clientTools,
 	})
 
 	ctx, cancel := context.WithTimeout(r.Context(), h.Cfg.TurnTimeout())
 	defer cancel()
 
-	clientTools := clientHasTools(req.Tools)
 	exec := h.execFor(clientTools)
+	runtimeSuffix := common.CompactToolsInstruction(req.Tools)
+	var catalog *common.ClientTools
+	if !exec {
+		catalog = common.NewClientTools(req.Tools, req.ToolChoice)
+	}
 	if req.Stream {
-		h.stream(w, ctx, reqID, model, agentMode, thinking, text, tail, final, atts, conversationID, exec, clientTools, dlogDir)
+		h.stream(w, ctx, reqID, model, agentMode, thinking, text, tail, final, atts, conversationID, exec, runtimeSuffix, dlogDir, catalog)
 		return
 	}
-	h.complete(w, ctx, reqID, model, agentMode, thinking, text, tail, final, atts, conversationID, exec, dlogDir)
+	h.complete(w, ctx, reqID, model, agentMode, thinking, text, tail, final, atts, conversationID, exec, runtimeSuffix, dlogDir, catalog)
 }
 
 // clientHasTools reports whether the client declared its own tool
 // schemas — those belong to the client's runtime in auto mode.
 func clientHasTools(raw json.RawMessage) bool {
 	return len(raw) > 0 && string(raw) != "null" && string(raw) != "[]"
+}
+
+func clientToolCount(raw json.RawMessage) int {
+	var tools []json.RawMessage
+	if json.Unmarshal(raw, &tools) != nil {
+		return 0
+	}
+	return len(tools)
 }
 
 // conversationIDOf resolves the client-supplied conversation id. Sources,
@@ -243,11 +284,11 @@ func conversationIDOf(r *http.Request, req *MessagesRequest) string {
 // complete handles the non-streaming path.
 func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 	reqID, model, agentMode, thinking, text, tail, final string,
-	atts []chat.Attachment, conversationID string, exec bool, dlogDir string) {
+	atts []chat.Attachment, conversationID string, exec bool, runtimeSuffix, dlogDir string, catalog *common.ClientTools) {
 
 	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, final, atts,
-		conversationID, exec, frames, nil, nil)
+		conversationID, exec, runtimeSuffix, frames, nil, nil)
 	// Always write frames before returning — the error path is exactly
 	// where they are needed to see the upstream's real error payload.
 	frames.Write(h.Debug, dlogDir)
@@ -257,19 +298,15 @@ func (h *Handler) complete(w http.ResponseWriter, ctx context.Context,
 		return
 	}
 
-	content := parseToolCalls(res.Text)
+	content, stopReason := responseContent(res, catalog)
 	out := anthropicMessage{
-		ID:      "msg_" + reqID,
-		Type:    "message",
-		Role:    "assistant",
-		Model:   util.Or(res.ResolvedModel, model),
-		Content: content,
-		Usage:   mapUsage(res.Usage),
-	}
-	if len(content) == 1 && content[0].Type == "text" {
-		out.StopReason = "end_turn"
-	} else {
-		out.StopReason = "tool_use"
+		ID:         "msg_" + reqID,
+		Type:       "message",
+		Role:       "assistant",
+		Model:      util.Or(res.ResolvedModel, model),
+		Content:    content,
+		Usage:      mapUsage(res.Usage),
+		StopReason: stopReason,
 	}
 	h.finishDebug(dlogDir, &out, nil)
 	w.Header().Set("Content-Type", "application/json")
@@ -310,7 +347,7 @@ func (h *Handler) execFor(clientTools bool) bool {
 // of the raw tool JSON.
 func (h *Handler) runAgent(ctx context.Context,
 	reqID, agentMode, thinking, text, tail, final string,
-	atts []chat.Attachment, conversationID string, exec bool,
+	atts []chat.Attachment, conversationID string, exec bool, runtimeSuffix string,
 	frames *common.Frames, onDelta func(string),
 	onToolRound func(round int, calls []common.ToolCallJSON)) (*chat.TurnResult, error) {
 
@@ -336,6 +373,7 @@ func (h *Handler) runAgent(ctx context.Context,
 			Text:           prompt,
 			Tail:           roundTail,
 			Final:          roundFinal,
+			Suffix:         runtimeSuffix,
 			AgentMode:      agentMode,
 			ThinkingEffort: thinking,
 			UserTimezone:   h.Cfg.Quick.UserTimezone,
@@ -353,8 +391,14 @@ func (h *Handler) runAgent(ctx context.Context,
 		if err != nil {
 			return nil, err
 		}
+		if res.PartialOnClose {
+			return nil, &chat.UpstreamError{Code: "incomplete_response", Message: "upstream closed before message_complete"}
+		}
+		if res.FinishReason == "content_filter" {
+			return res, nil
+		}
 
-		calls, _ := common.ParseToolCallsJSON(res.Text)
+		calls, _ := common.ParseToolCallsJSON(res.ToolText())
 		if len(calls) == 0 || !exec {
 			return res, nil
 		}
@@ -390,58 +434,51 @@ func (h *Handler) runAgent(ctx context.Context,
 // event, and the final non-tool round's text is emitted as one delta.
 func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 	reqID, model, agentMode, thinking, text, tail, final string,
-	atts []chat.Attachment, conversationID string, exec, clientTools bool, dlogDir string) {
+	atts []chat.Attachment, conversationID string, exec bool, runtimeSuffix, dlogDir string, catalog *common.ClientTools) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	fl, ok := w.(http.Flusher)
+	_, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, "api_error", "streaming unsupported")
 		return
 	}
 	w.WriteHeader(http.StatusOK)
 
-	emit := func(event string, v any) bool {
-		data, err := json.Marshal(v)
-		if err != nil {
-			return false
-		}
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
-		fl.Flush()
-		return true
-	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream := &messageStream{w: w, cancel: cancel}
+	emit := stream.emit
 
 	msgID := "msg_" + reqID
-	started := false
-	start := func() {
-		if started {
-			return
-		}
-		started = true
-		emit("message_start", map[string]any{
-			"message": map[string]any{
-				"id": msgID, "type": "message", "role": "assistant",
-				"model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil,
-				"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
-			},
-		})
-		emit("content_block_start", map[string]any{
-			"index":         0,
-			"content_block": map[string]any{"type": "text", "text": ""},
-		})
+	if !emit("message_start", map[string]any{
+		"message": map[string]any{
+			"id": msgID, "type": "message", "role": "assistant",
+			"model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+		},
+	}) {
+		return
 	}
-	start()
+	if !emit("content_block_start", map[string]any{
+		"index":         0,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	}) {
+		return
+	}
+	stopKeepalive := stream.startKeepalive(ctx, streamPingInterval)
+	defer stopKeepalive()
 
 	// Live deltas only when nothing will intercept the answer: no
 	// executor on this request and no client-declared tools whose
 	// passthrough would still arrive as a single tool_use block.
-	liveDeltas := !exec && !clientTools
+	liveDeltas := !exec && runtimeSuffix == ""
 
 	frames := common.NewFrames(h.Debug.LogFrames)
 	res, err := h.runAgent(ctx, reqID, agentMode, thinking, text, tail, final, atts,
-		conversationID, exec, frames,
+		conversationID, exec, runtimeSuffix, frames,
 		func(delta string) {
 			if liveDeltas {
 				emit("content_block_delta", map[string]any{
@@ -462,57 +499,46 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 				"round": round, "calls": names,
 			})
 		})
+	stopKeepalive()
 	frames.Write(h.Debug, dlogDir)
 
-	if err == nil && res != nil && !liveDeltas {
-		// The final text was buffered — emit it now as one delta, unless
-		// it parses as tool calls (emitted as a tool_use block below).
-		if calls, _ := common.ParseToolCallsJSON(res.Text); len(calls) == 0 {
-			emit("content_block_delta", map[string]any{
-				"index": 0,
-				"delta": map[string]any{"type": "text_delta", "text": res.Text},
-			})
+	var content []ContentBlock
+	var stopReason string
+	if err == nil && res != nil {
+		content, stopReason = responseContent(res, catalog)
+	}
+	if !liveDeltas && len(content) > 0 && content[0].Type == "text" {
+		// Narration and tool calls are distinct blocks. Never stream the
+		// original JSON as text before classifying a buffered reply.
+		if !emit("content_block_delta", map[string]any{
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": content[0].Text},
+		}) {
+			return
 		}
 	}
 
-	// close the text block even on error — clients expect a terminated stream
-	emit("content_block_stop", map[string]any{"index": 0})
-
-	if err != nil {
-		h.finishDebug(dlogDir, nil, err)
-		emit("message_delta", map[string]any{
-			"delta": map[string]any{"stop_reason": "error"},
-			"usage": map[string]any{"output_tokens": 0},
-		})
-		emit("error", map[string]any{"type": "error", "error": map[string]any{
-			"type": "api_error", "message": err.Error(),
-		}})
-		emit("message_stop", map[string]any{})
+	if !emit("content_block_stop", map[string]any{"index": 0}) {
 		return
 	}
 
-	// If the whole answer is a tool call, translate it into a tool_use block
-	// (still a single block; legal to emit after the text block closes).
-	content := parseToolCalls(res.Text)
-	stopReason := "end_turn"
-	if len(content) == 1 && content[0].Type == "tool_use" {
-		stopReason = "tool_use"
-		emit("content_block_start", map[string]any{
-			"index":         1,
-			"content_block": content[0],
-		})
-		emit("content_block_delta", map[string]any{
-			"index": 1,
-			"delta": map[string]any{
-				"type":         "input_json_delta",
-				"partial_json": string(content[0].Input),
-			},
-		})
-		emit("content_block_stop", map[string]any{"index": 1})
+	if err != nil {
+		h.finishDebug(dlogDir, nil, err)
+		_, errorType, message := upstreamErrorDetails(err)
+		// An SSE error is terminal. "error" is not an Anthropic stop_reason,
+		// and a normal message_stop must not advertise a failed turn as done.
+		emit("error", map[string]any{"type": "error", "error": map[string]any{
+			"type": errorType, "message": message,
+		}})
+		return
+	}
+
+	if !emitToolBlocks(emit, content) {
+		return
 	}
 
 	u := mapUsage(res.Usage)
-	emit("message_delta", map[string]any{
+	if !emit("message_delta", map[string]any{
 		"delta": map[string]any{
 			"stop_reason":   stopReason,
 			"stop_sequence": nil,
@@ -523,13 +549,87 @@ func (h *Handler) stream(w http.ResponseWriter, ctx context.Context,
 			"cache_read_input_tokens":     u.CacheReadInputTokens,
 			"cache_creation_input_tokens": u.CacheCreationInputTokens,
 		},
-	})
-	emit("message_stop", map[string]any{})
+	}) {
+		return
+	}
+	if !emit("message_stop", map[string]any{}) {
+		return
+	}
 	h.finishDebug(dlogDir, &anthropicMessage{
 		ID: msgID, Type: "message", Role: "assistant",
 		Model: util.Or(res.ResolvedModel, model), Content: content,
 		StopReason: stopReason, Usage: u,
 	}, nil)
+}
+
+// A blocked answer must remain a refusal even if its partial text resembles
+// tool-call JSON. Never execute it or advertise a normal successful turn.
+func responseContent(res *chat.TurnResult, catalog *common.ClientTools) ([]ContentBlock, string) {
+	if res.FinishReason == "content_filter" {
+		return []ContentBlock{{Type: "text", Text: res.Text}}, "refusal"
+	}
+	if !res.PartialOnClose && res.FinishReason == "stop" {
+		if catalog != nil {
+			if narration, calls, ok := catalog.ParseReply(res.ToolText()); ok {
+				content := make([]ContentBlock, 0, len(calls)+1)
+				if narration != "" {
+					content = append(content, ContentBlock{Type: "text", Text: narration})
+				}
+				for _, call := range calls {
+					id := call.ID
+					if id == "" {
+						id = common.NewID("toolu")
+					}
+					content = append(content, ContentBlock{Type: "tool_use", ID: id, Name: call.Name, Input: call.Input})
+				}
+				return content, "tool_use"
+			}
+		} else {
+			// Server-execution mode retains its strict whole-response parser;
+			// mixed prose is eligible only for declared client tools.
+			content := parseToolCalls(res.ToolText())
+			if len(content) == 1 && content[0].Type == "tool_use" {
+				return content, "tool_use"
+			}
+		}
+	}
+	return []ContentBlock{{Type: "text", Text: res.Text}}, "end_turn"
+}
+
+// Index 0 is the narration block started before the upstream turn. Each tool
+// gets its own subsequent block, with input supplied exactly once via deltas.
+func emitToolBlocks(emit func(string, map[string]any) bool, content []ContentBlock) bool {
+	index := 1
+	for _, block := range content {
+		if block.Type != "tool_use" {
+			continue
+		}
+		start := block
+		start.Input = json.RawMessage(`{}`)
+		if !emit("content_block_start", map[string]any{"index": index, "content_block": start}) {
+			return false
+		}
+		if !emit("content_block_delta", map[string]any{"index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": string(block.Input)}}) {
+			return false
+		}
+		if !emit("content_block_stop", map[string]any{"index": index}) {
+			return false
+		}
+		index++
+	}
+	return true
+}
+
+// SDK stream accumulators dispatch on the JSON type, not only the SSE event
+// header. Both must be present and match, including message_stop.
+func writeSSE(w io.Writer, event string, data map[string]any) error {
+	data["type"] = event
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
+	return err
 }
 
 func (h *Handler) finishDebug(dir string, out any, runErr error) {
@@ -557,6 +657,9 @@ func (h *Handler) finishDebug(dir string, out any, runErr error) {
 // message history begins — everything before it is the request preamble
 // (system prompt + tools instruction). Callers use text[tailAt:] as the
 // delta-eligible Tail so preamble drift never poisons the prefix check.
+// lastMsgAt points to the start of the latest operative message. Its slice
+// includes trailing system/environment messages, which must not displace
+// the user's request from the inline portion of an oversized prompt.
 func renderPrompt(req *MessagesRequest) (text string, tailAt, lastMsgAt int, atts []chat.Attachment, err error) {
 	var b strings.Builder
 
@@ -590,76 +693,82 @@ func renderPrompt(req *MessagesRequest) (text string, tailAt, lastMsgAt int, att
 	lastMsgAt = tailAt
 	for _, m := range req.Messages {
 		msgStart := b.Len()
+		label := "User"
+		switch m.Role {
+		case "assistant":
+			label = "Assistant"
+		case "system":
+			label = "System"
+		}
 		// content: string | [ blocks ]
 		var s string
 		if err := json.Unmarshal(m.Content, &s); err == nil {
 			if s != "" {
-				label := "User"
-				if m.Role == "assistant" {
-					label = "Assistant"
-				}
 				fmt.Fprintf(&b, "%s: %s\n\n", label, s)
-				lastMsgAt = msgStart
+				if m.Role != "system" {
+					lastMsgAt = msgStart
+				}
 			}
 			continue
 		}
-		var blocks []ContentBlock
+		var blocks []json.RawMessage
 		if err := json.Unmarshal(m.Content, &blocks); err != nil {
 			return "", 0, 0, nil, fmt.Errorf("%s message: content must be a string or blocks", m.Role)
 		}
-		for _, bl := range blocks {
+		for _, rawBlock := range blocks {
+			var bl ContentBlock
+			if err := json.Unmarshal(rawBlock, &bl); err != nil {
+				return "", 0, 0, nil, fmt.Errorf("%s message block: %w", m.Role, err)
+			}
 			switch bl.Type {
 			case "text":
-				label := "User"
-				if m.Role == "assistant" {
-					label = "Assistant"
-				}
 				fmt.Fprintf(&b, "%s: %s\n\n", label, bl.Text)
-			case "image":
-				a, aerr := attachmentFromImageBlock(&bl)
+			case "image", "document":
+				var a *chat.Attachment
+				var aerr error
+				if bl.Type == "image" {
+					a, aerr = attachmentFromImageBlock(&bl)
+				} else {
+					a, aerr = attachmentFromDocumentBlock(&bl)
+				}
 				if aerr != nil {
-					return "", 0, 0, nil, fmt.Errorf("image block: %w", aerr)
+					return "", 0, 0, nil, fmt.Errorf("%s block: %w", bl.Type, aerr)
 				}
-				if a != nil {
-					atts = append(atts, *a)
+				if a == nil {
+					return "", 0, 0, nil, fmt.Errorf("missing %s attachment", bl.Type)
 				}
-			case "document":
-				a, aerr := attachmentFromDocumentBlock(&bl)
-				if aerr != nil {
-					return "", 0, 0, nil, fmt.Errorf("document block: %w", aerr)
+				digest := sha256.Sum256(rawBlock)
+				a.Name = fmt.Sprintf("input-%x.%s", digest[:8], extForMime(a.MimeType))
+				reference, refErr := attachmentReference(rawBlock, a.Name)
+				if refErr != nil {
+					return "", 0, 0, nil, refErr
 				}
-				if a != nil {
-					atts = append(atts, *a)
-				}
+				a.TranscriptOffset = b.Len() + 1
+				atts = append(atts, *a)
+				fmt.Fprintf(&b, "%s: %s\n\n", label, reference)
 			case "tool_use":
-				fmt.Fprintf(&b, "ToolUse %s(%s)\n\n", bl.Name, string(bl.Input))
+				// Keep the correlation ID and escape embedded newlines. A tool
+				// transcript is data, not a new User/System instruction.
+				data, marshalErr := json.Marshal(ContentBlock{Type: bl.Type, ID: bl.ID, Name: bl.Name, Input: bl.Input})
+				if marshalErr != nil {
+					return "", 0, 0, nil, fmt.Errorf("tool_use: %w", marshalErr)
+				}
+				fmt.Fprintf(&b, "ToolUse: %s\n\n", data)
 			case "tool_result":
-				inner := ""
-				if len(bl.Content) > 0 {
-					var s string
-					if json.Unmarshal(bl.Content, &s) == nil {
-						inner = s
-					} else {
-						var parts []ContentBlock
-						if json.Unmarshal(bl.Content, &parts) == nil {
-							for _, p := range parts {
-								if p.Type == "text" {
-									inner += p.Text
-								}
-							}
-						}
-					}
+				data, resultAtts, resultErr := renderToolResult(bl)
+				if resultErr != nil {
+					return "", 0, 0, nil, fmt.Errorf("tool_result: %w", resultErr)
 				}
-				label := "ToolResult"
-				if bl.IsError {
-					label += " (error)"
+				for i := range resultAtts {
+					resultAtts[i].TranscriptOffset = b.Len() + 1
 				}
-				fmt.Fprintf(&b, "%s: %s\n\n", label, inner)
+				atts = append(atts, resultAtts...)
+				fmt.Fprintf(&b, "ToolResult: %s\n\n", data)
 			default:
 				// thinking/redacted_thinking/etc — dropped silently.
 			}
 		}
-		if b.Len() > msgStart {
+		if b.Len() > msgStart && m.Role != "system" {
 			lastMsgAt = msgStart
 		}
 	}
@@ -669,6 +778,65 @@ func renderPrompt(req *MessagesRequest) (text string, tailAt, lastMsgAt int, att
 		return "", 0, 0, nil, errors.New("messages rendered to empty text")
 	}
 	return out, tailAt, lastMsgAt, atts, nil
+}
+
+// renderToolResult preserves IDs, errors and content-block boundaries. Images
+// and documents inside results use the same upload path as top-level content;
+// base64 bytes are replaced by stable attachment references in the transcript.
+func renderToolResult(bl ContentBlock) ([]byte, []chat.Attachment, error) {
+	var atts []chat.Attachment
+	var parts []json.RawMessage
+	var text string
+	if len(bl.Content) > 0 && string(bl.Content) != "null" && json.Unmarshal(bl.Content, &text) != nil {
+		if err := json.Unmarshal(bl.Content, &parts); err != nil {
+			return nil, nil, errors.New("content must be a string or blocks")
+		}
+		digest := sha256.Sum256(bl.Content)
+		for i, raw := range parts {
+			var part ContentBlock
+			if err := json.Unmarshal(raw, &part); err != nil {
+				return nil, nil, err
+			}
+			var att *chat.Attachment
+			var err error
+			switch part.Type {
+			case "image":
+				att, err = attachmentFromImageBlock(&part)
+			case "document":
+				att, err = attachmentFromDocumentBlock(&part)
+			default:
+				continue // retain other blocks verbatim, including text
+			}
+			if err != nil {
+				return nil, nil, err
+			}
+			if att == nil {
+				return nil, nil, errors.New("missing result attachment")
+			}
+			att.Name = fmt.Sprintf("tool-result-%x-%d.%s", digest[:8], i, extForMime(att.MimeType))
+			atts = append(atts, *att)
+			parts[i], err = attachmentReference(raw, att.Name)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		bl.Content, _ = json.Marshal(parts)
+	}
+	data, err := json.Marshal(ContentBlock{Type: "tool_result", ToolUseID: bl.ToolUseID, Content: bl.Content, IsError: bl.IsError})
+	return data, atts, err
+}
+
+func attachmentReference(raw json.RawMessage, name string) ([]byte, error) {
+	var reference map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &reference); err != nil {
+		return nil, err
+	}
+	if reference == nil {
+		return nil, errors.New("attachment block must be an object")
+	}
+	delete(reference, "source")
+	reference["attachment"], _ = json.Marshal(name)
+	return json.Marshal(reference)
 }
 
 // attachmentFromImageBlock converts an Anthropic `image` content block
@@ -725,7 +893,7 @@ func attachmentFromImageBlock(bl *ContentBlock) (*chat.Attachment, error) {
 }
 
 // attachmentFromDocumentBlock converts a `document` block (PDF/txt/etc,
-// base64 or URL) into a chat.Attachment.
+// base64, plain-text or URL source) into a chat.Attachment.
 func attachmentFromDocumentBlock(bl *ContentBlock) (*chat.Attachment, error) {
 	if len(bl.Source) == 0 {
 		return nil, errors.New("missing source")
@@ -744,11 +912,14 @@ func attachmentFromDocumentBlock(bl *ContentBlock) (*chat.Attachment, error) {
 	if mime == "" {
 		mime = "application/octet-stream"
 	}
-	if t := extForMime(mime); t != "bin" {
-		name = "document." + t
-	}
 	var raw []byte
 	switch src.Type {
+	case "text":
+		if src.MediaType != "" && src.MediaType != "text/plain" {
+			return nil, errors.New("text document source requires text/plain")
+		}
+		mime = "text/plain"
+		raw = []byte(src.Data)
 	case "base64":
 		b, err := base64.StdEncoding.DecodeString(src.Data)
 		if err != nil {
@@ -766,6 +937,9 @@ func attachmentFromDocumentBlock(bl *ContentBlock) (*chat.Attachment, error) {
 		}
 	default:
 		return nil, fmt.Errorf("unsupported document source type %q", src.Type)
+	}
+	if t := extForMime(mime); t != "bin" {
+		name = "document." + t
 	}
 	return &chat.Attachment{Name: name, MimeType: mime, Data: raw}, nil
 }
@@ -848,6 +1022,11 @@ func mapUsage(u *chat.TurnUsage) anthropicUsage {
 }
 
 func writeUpstream(w http.ResponseWriter, err error) {
+	status, typ, msg := upstreamErrorDetails(err)
+	writeErr(w, status, typ, msg)
+}
+
+func upstreamErrorDetails(err error) (int, string, string) {
 	status, kind, msg := common.UpstreamError(err)
 	typ := "api_error"
 	switch kind {
@@ -856,9 +1035,11 @@ func writeUpstream(w http.ResponseWriter, err error) {
 	case common.KindRateLimited:
 		typ = "rate_limit_error"
 	case common.KindTimeout:
-		typ = "timeout"
+		typ = "timeout_error"
+	case common.KindPermissionDenied:
+		typ = "permission_error"
 	}
-	writeErr(w, status, typ, msg)
+	return status, typ, msg
 }
 
 func writeErr(w http.ResponseWriter, status int, typ, msg string) {

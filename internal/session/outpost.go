@@ -24,11 +24,12 @@ import (
 
 // SpawnOpts parameterizes Spawn.
 type SpawnOpts struct {
-	AgentPath  string
-	Manifest   string // -manifest value, "desktop"
-	BuildStage string // QUICKWORK_BUILD_STAGE
-	Port       int
-	WorkDir    string // agent working dir; empty = os.TempDir
+	AgentPath   string
+	Manifest    string // -manifest value, "desktop"
+	BuildStage  string // QUICKWORK_BUILD_STAGE
+	ProfileRoot string // existing user-approved Quick profile; QUICKWORK_ROOT
+	Port        int
+	WorkDir     string // agent working dir; empty = os.TempDir
 }
 
 // Outpost is a running quickwork-agent outpost instance.
@@ -114,6 +115,9 @@ func Spawn(ctxDone <-chan struct{}, opts SpawnOpts) (*Outpost, error) {
 	)
 	cmd.Dir = opts.WorkDir
 	cmd.Env = append(os.Environ(), "QUICKWORK_BUILD_STAGE="+util.Or(opts.BuildStage, "prod"))
+	if opts.ProfileRoot != "" {
+		cmd.Env = append(cmd.Env, "QUICKWORK_ROOT="+opts.ProfileRoot)
+	}
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	setSpawnAttrs(cmd)

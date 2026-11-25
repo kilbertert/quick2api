@@ -7,9 +7,11 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -52,6 +54,12 @@ type ToolsConfig struct {
 	//   "server"      — the executor always intercepts, even when the
 	//                 client declared its own tools (server wins).
 	Mode string `yaml:"mode"`
+	// ClientTransport selects the external client tool path. Empty/"prompt"
+	// preserves the text compatibility contract. "mcp" requires an explicitly
+	// registered native MCP relay and never falls back to prompt JSON.
+	ClientTransport string `yaml:"client_transport"`
+	NativeRelayName string `yaml:"native_relay_name"`
+	BridgeTimeoutS  int    `yaml:"bridge_timeout_seconds"`
 }
 
 // ServerConfig controls the HTTP listener and request ceiling.
@@ -61,6 +69,10 @@ type ServerConfig struct {
 	// MaxConcurrency bounds simultaneously-running /v1 completions. Excess
 	// requests fast-fail 429 instead of queueing on a shared upstream quota.
 	MaxConcurrency int `yaml:"max_concurrency"`
+	// MaxRequestBodyBytes bounds JSON input to model API endpoints, including
+	// full client history and encoded attachments. Zero uses the 32 MiB default.
+	// The internal tool-result relay has its own smaller, independent budget.
+	MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes"`
 	// TurnTimeoutSeconds caps one upstream turn (ws open → message_complete).
 	TurnTimeoutSeconds int `yaml:"turn_timeout_seconds"`
 }
@@ -85,6 +97,9 @@ type QuickConfig struct {
 	// BuildStage maps to QUICKWORK_BUILD_STAGE; the agent exits non-zero
 	// without it ("prod" for release installs).
 	BuildStage string `yaml:"build_stage"`
+	// ProfileRoot selects an existing Quick account profile for a spawned
+	// outpost. It does not create MCP registrations or alter approval state.
+	ProfileRoot string `yaml:"profile_root"`
 	// OutpostPort is the loopback port for the spawned outpost instance.
 	// We never reuse 8780: that instance belongs to the running Quick app and
 	// its bearer token lives only in the app's main process.
@@ -166,9 +181,10 @@ type APIConfig struct {
 func Defaults() *Config {
 	return &Config{
 		Server: ServerConfig{
-			Listen:             "127.0.0.1:8377",
-			MaxConcurrency:     16,
-			TurnTimeoutSeconds: 600,
+			Listen:              "127.0.0.1:8377",
+			MaxConcurrency:      16,
+			MaxRequestBodyBytes: 32 << 20,
+			TurnTimeoutSeconds:  600,
 		},
 		Debug: DebugConfig{
 			Enabled:       false,
@@ -229,6 +245,9 @@ func (c *Config) Validate() error {
 	if c.Server.MaxConcurrency < 0 {
 		return errors.New("server.max_concurrency must be >= 0")
 	}
+	if c.Server.MaxRequestBodyBytes < 0 || c.Server.MaxRequestBodyBytes > 128<<20 {
+		return errors.New("server.max_request_body_bytes must be 0..134217728 (0 uses the 32 MiB default)")
+	}
 	hasURL := c.Quick.OutpostURL != ""
 	hasTok := c.Quick.OutpostToken != ""
 	if hasURL != hasTok {
@@ -250,6 +269,25 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("tools.mode must be auto|passthrough|server, got %q", c.Tools.Mode)
 	}
+	switch c.Tools.ClientTransport {
+	case "", "prompt":
+	case "mcp":
+		host, _, err := net.SplitHostPort(c.Server.Listen)
+		if err != nil || (host != "127.0.0.1" && host != "::1") || c.API.APIKey == "" {
+			return errors.New("mcp client transport requires an explicit loopback listener and a nonempty api.api_key")
+		}
+		if c.Tools.Mode == "server" {
+			return errors.New("mcp client transport cannot use server tool execution mode")
+		}
+		if c.Tools.NativeRelayName != "quick2api_client_call" && !strings.HasSuffix(c.Tools.NativeRelayName, "__quick2api_client_call") {
+			return errors.New("tools.native_relay_name must identify the registered quick2api_client_call tool")
+		}
+	default:
+		return errors.New("tools.client_transport must be prompt|mcp")
+	}
+	if c.Tools.BridgeTimeoutS < 0 || c.Tools.BridgeTimeoutS > 300 {
+		return errors.New("tools.bridge_timeout_seconds must be 0..300")
+	}
 	for i, a := range c.Quick.Accounts {
 		switch {
 		case a.OutpostURL != "" && a.SessionFile != "":
@@ -259,6 +297,14 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// RequestBodyLimit applies to Messages, count_tokens and Chat Completions.
+func (c *Config) RequestBodyLimit() int64 {
+	if c == nil || c.Server.MaxRequestBodyBytes <= 0 {
+		return 32 << 20
+	}
+	return c.Server.MaxRequestBodyBytes
 }
 
 // ConnIdleTTL bounds how long a pooled upstream conversation may sit

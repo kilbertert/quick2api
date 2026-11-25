@@ -110,16 +110,18 @@ ssh -N -R 8377:127.0.0.1:8377 user@dev-host
   独立建会话。登出/吊销 → 上游回 401、`/healthz` 报 `degraded`，直到
   应用里重登为止。
 - **会话复用是可选的。** 不带 `X-Conversation-Id`/`X-Session-Id` 时
-  每个请求仍开新的上游 turn；带上则按 id 复用同一 thread。
-- **工具在服务端跑。** config 里 `tools:` 开起来后由本地 executor
-  （`bash`/`files`）应答 `{type:"tool_use",...}`——上游模型本身不跑
-  工具。`tools.max_tool_rounds` 限轮。
+  每个请求仍开新的上游 turn；带上则复用严格追加的历史。历史分歧或
+  重连时建立新的上游 thread；同一客户端会话的请求串行执行。
+- **服务端执行器是可选的。** config 里的 `tools:` 可启用本地
+  executor（`bash`/`files`），`tools.max_tool_rounds` 限轮。
+  Quick 也有自己的原生工具，与这些执行器相互独立。
 - **多账号要不同 outpost。** `quick.accounts` 在 lane 间轮询，但真
   多账号得一个 lane 一个 outpost（分开的 Quick 安装或挂别的
   `outpost_url`）。`max_concurrency` 是进程级，lane 间仍共享 CPU/内存。
-- **客户端 tools 声明默认是建议性。** 不开 `tools:` 时代理只是把
-  schema 写进 prompt，然后把 `{type:"tool_use",...}` 解析出来——不
-  执行。
+- **客户端工具通过文本契约兼容。** 透传模式把 schema 写进 prompt，
+  将完整的 `{type:"tool_use",...}` 回复转换为结构化 API 工具调用，
+  交由客户端执行。这不会向 Quick 注册原生工具，上游仍可能拒绝。
+  修复、验证结果和限制见 [客户端工具兼容性说明](docs/client-tool-compatibility.md)。
 
 ## v1.1 新加
 

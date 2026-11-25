@@ -128,8 +128,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ChatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "bad JSON: "+err.Error(), "")
+	if err := common.DecodeRequestBody(w, r, &req, h.Cfg.RequestBodyLimit()); err != nil {
+		status, kind, message := common.RequestBodyError(err)
+		writeError(w, status, kind, message, "")
 		return
 	}
 	if len(req.Messages) == 0 {
@@ -255,13 +256,13 @@ func (h *Handler) complete(w http.ResponseWriter, r *http.Request, ctx context.C
 		Model:   util.Or(res.ResolvedModel, model),
 		Choices: []choice{{
 			Index:        0,
-			Message:      messageOutFor(res.Text),
+			Message:      messageOutForResult(res),
 			FinishReason: res.FinishReason,
 		}},
 		Usage: mapUsage(res.Usage),
 	}
 	// finish_reason=tool_calls when the answer is a tool call.
-	if calls, ok := common.ParseToolCallsJSON(res.Text); ok && len(calls) > 0 {
+	if calls, ok := toolCallsForResult(res); ok && len(calls) > 0 {
 		out.Choices[0].FinishReason = "tool_calls"
 		out.Choices[0].Message = &MessageOut{
 			Role:      "assistant",
@@ -322,8 +323,11 @@ func (h *Handler) runAgent(ctx context.Context,
 		if err != nil {
 			return nil, err
 		}
+		if res.FinishReason == "content_filter" || res.PartialOnClose {
+			return res, nil
+		}
 
-		calls, _ := common.ParseToolCallsJSON(res.Text)
+		calls, _ := toolCallsForResult(res)
 		if len(calls) == 0 || !exec {
 			return res, nil
 		}
@@ -362,6 +366,20 @@ func messageOutFor(text string) *MessageOut {
 		}
 	}
 	return &MessageOut{Role: "assistant", Content: text}
+}
+
+func toolCallsForResult(res *chat.TurnResult) ([]common.ToolCallJSON, bool) {
+	if res.FinishReason == "content_filter" || res.PartialOnClose {
+		return nil, false
+	}
+	return common.ParseToolCallsJSON(res.ToolText())
+}
+
+func messageOutForResult(res *chat.TurnResult) *MessageOut {
+	if calls, ok := toolCallsForResult(res); ok && len(calls) > 0 {
+		return &MessageOut{Role: "assistant", ToolCalls: openAIToolCalls(calls)}
+	}
+	return &MessageOut{Role: "assistant", Content: res.Text}
 }
 
 // openAIToolCalls translates the model's tool_use JSON into OpenAI's
@@ -452,8 +470,13 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 		h.finishDebug(dlogDir, nil, err)
 		// OpenAI streams still terminate with [DONE]; send an error event
 		// chunk so clients see a typed failure rather than a silent cut.
+		_, kind, message := common.UpstreamError(err)
+		errorType := "upstream_error"
+		if kind == common.KindPermissionDenied {
+			errorType = "permission_error"
+		}
 		emit(map[string]any{"error": map[string]any{
-			"type": "upstream_error", "message": err.Error(),
+			"type": errorType, "message": message,
 		}})
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		fl.Flush()
@@ -464,7 +487,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	// Buffered reply: emit the final text as one delta, unless it parses
 	// as tool calls (emitted below as a tool_calls delta).
 	if !liveDeltas {
-		if calls, ok := common.ParseToolCallsJSON(result.Text); !ok || len(calls) == 0 {
+		if calls, ok := toolCallsForResult(result); !ok || len(calls) == 0 {
 			emit(completion{
 				ID: "chatcmpl-" + reqID, Object: "chat.completion.chunk",
 				Created: time.Now().Unix(), Model: model,
@@ -479,7 +502,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 		Choices: []choice{{Index: 0, Delta: &MessageOut{}, FinishReason: result.FinishReason}},
 		Usage:   mapUsage(result.Usage),
 	}
-	if calls, ok := common.ParseToolCallsJSON(result.Text); ok && len(calls) > 0 {
+	if calls, ok := toolCallsForResult(result); ok && len(calls) > 0 {
 		fin.Choices[0].FinishReason = "tool_calls"
 		fin.Choices[0].Delta = &MessageOut{
 			Role:      "assistant",
@@ -492,7 +515,7 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	h.finishDebug(dlogDir, &completion{
 		ID: "chatcmpl-" + reqID, Object: "chat.completion",
 		Created: time.Now().Unix(), Model: util.Or(result.ResolvedModel, model),
-		Choices: []choice{{Index: 0, Message: messageOutFor(result.Text), FinishReason: fin.Choices[0].FinishReason}},
+		Choices: []choice{{Index: 0, Message: messageOutForResult(result), FinishReason: fin.Choices[0].FinishReason}},
 		Usage:   mapUsage(result.Usage),
 	}, nil)
 }
@@ -797,6 +820,8 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 		typ = "rate_limit_error"
 	case common.KindTimeout:
 		typ = "timeout"
+	case common.KindPermissionDenied:
+		typ = "permission_error"
 	}
 	// keep the upstream's own code in the "code" field when present.
 	var ue *chat.UpstreamError

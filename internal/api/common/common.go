@@ -71,16 +71,40 @@ func Acquire(ctx context.Context, sem chan struct{}) (release func(), ok bool) {
 type UpstreamKind int
 
 const (
-	KindUpstream        UpstreamKind = iota // generic upstream failure → 502
-	KindUnauthenticated                     // upstream says creds bad/expired → 401
-	KindRateLimited                         // upstream throttled → 429
-	KindTimeout                             // ctx deadline → 504
+	KindUpstream         UpstreamKind = iota // generic upstream failure → 502
+	KindUnauthenticated                      // upstream says creds bad/expired → 401
+	KindRateLimited                          // upstream throttled → 429
+	KindTimeout                              // ctx deadline → 504
+	KindPermissionDenied                     // attachment policy blocked input → 403
 )
 
 // UpstreamError maps err to (httpStatus, kind, message). Message is the
 // user-facing text: UpstreamError.Message for typed frames, err.Error()
 // otherwise (it carries the "upstream: " prefix).
 func UpstreamError(err error) (status int, kind UpstreamKind, message string) {
+	// Setup retains its typed cause for classification, but its safe message
+	// must take precedence over arbitrary upstream bodies or close reasons.
+	var setup *chat.ConnectionSetupError
+	if errors.As(err, &setup) {
+		message = setup.Error()
+		var cause *chat.UpstreamError
+		if errors.As(setup, &cause) {
+			switch cause.Code {
+			case "unauthenticated", "token_expired":
+				return http.StatusUnauthorized, KindUnauthenticated, message
+			case "rate_limited", "throttled":
+				return http.StatusTooManyRequests, KindRateLimited, message
+			}
+		}
+		if errors.Is(setup, context.DeadlineExceeded) {
+			return http.StatusGatewayTimeout, KindTimeout, message
+		}
+		return http.StatusBadGateway, KindUpstream, message
+	}
+	var policy *chat.AttachmentPolicyError
+	if errors.As(err, &policy) && policy.Blocked {
+		return http.StatusForbidden, KindPermissionDenied, policy.Message
+	}
 	var ue *chat.UpstreamError
 	if errors.As(err, &ue) {
 		switch ue.Code {
@@ -97,25 +121,31 @@ func UpstreamError(err error) (status int, kind UpstreamKind, message string) {
 	return http.StatusBadGateway, KindUpstream, err.Error()
 }
 
-// Frames collects upstream frames for the 01-frames debug file when
-// debug.log_frames is on. Adapters call OnEvent() inside their own
+// Frames collects event names for 01-events and, when debug.log_frames is
+// on, payloads for 01-frames. Adapters call OnEvent() inside their own
 // OnEvent chain, then Write() on every exit path.
 type Frames struct {
-	enabled bool
-	raw     []json.RawMessage
+	enabled  bool
+	raw      []json.RawMessage
+	sequence []string
+	counts   map[string]int
 }
 
-// NewFrames returns a collector; disabled collectors stay nil-cost.
+// NewFrames always collects event names; full payloads require explicit opt-in.
 func NewFrames(enabled bool) *Frames {
-	if !enabled {
-		return &Frames{}
-	}
-	return &Frames{enabled: true, raw: make([]json.RawMessage, 0, 64)}
+	return &Frames{enabled: enabled, counts: make(map[string]int)}
 }
 
 // OnEvent records ev when it is an upstream frame.
 func (f *Frames) OnEvent(ev chat.TurnEvent) {
-	if !f.enabled || ev.Kind != "frame" || ev.Frame == nil {
+	if ev.Kind != "frame" || ev.Frame == nil {
+		return
+	}
+	f.counts[ev.Frame.Type]++
+	if len(f.sequence) < 4096 {
+		f.sequence = append(f.sequence, ev.Frame.Type)
+	}
+	if !f.enabled {
 		return
 	}
 	if raw, err := json.Marshal(ev.Frame); err == nil {
@@ -123,11 +153,18 @@ func (f *Frames) OnEvent(ev chat.TurnEvent) {
 	}
 }
 
-// Write appends the collected frames to 01-frames (one JSONL line holding
-// the array). Safe to call on every path — disabled/empty writes nothing.
+// Write appends event names to 01-events and opt-in payloads to 01-frames.
+// The debug logger decides whether request logging is enabled.
 func (f *Frames) Write(log *debuglog.Logger, dir string) {
-	if !f.enabled || log == nil || len(f.raw) == 0 {
+	if log == nil {
 		return
 	}
-	log.Write(dir, "01-frames", f.raw)
+	// Event names establish turn boundaries without recording payloads,
+	// credentials, tool arguments, or the user's conversation content.
+	if len(f.sequence) > 0 {
+		log.Write(dir, "01-events", map[string]any{"sequence": f.sequence, "counts": f.counts})
+	}
+	if f.enabled && len(f.raw) > 0 {
+		log.Write(dir, "01-frames", f.raw)
+	}
 }

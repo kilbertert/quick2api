@@ -5,6 +5,76 @@ import (
 	"strings"
 )
 
+// ToolRuntimeReminder stays close to the operative user message. The full
+// schemas live in ToolsInstruction, but oversized requests move that preamble
+// into an attachment; this short suffix keeps the client/runtime boundary
+// unambiguous at the point where the model decides whether to call a tool.
+const ToolRuntimeReminder = `[LOCAL TOOL RUNTIME]
+This request comes through quick2api from a local Claude client agent. The client tools in the attached context are separate from Amazon Quick's native tools. quick2api parses a whole-response tool_use JSON object and returns it to the client as an Anthropic tool_use content block with stop_reason=tool_use. The local client runs the requested tool under its own permissions and sends a tool_result on the next request. You do not need direct access to its terminal or SSH connection. Requesting a tool is not claiming that it already ran; wait for its tool_result before reporting any output. When the task requires an available client tool, respond with ONLY one JSON object using its exact declared name and input schema:
+{"type":"tool_use","id":"<id>","name":"<exact tool name>","input":{...}}
+Do not add explanation or Markdown. When no tool is needed, answer normally.`
+
+// CompactToolsInstruction keeps the callable schemas inline even when the full
+// descriptions live in an attachment. Schema annotations are omitted here only;
+// the original ToolsInstruction remains the source for tool behavior and limits.
+func CompactToolsInstruction(raw json.RawMessage) string {
+	var tools []struct {
+		Name   string          `json:"name"`
+		Schema json.RawMessage `json:"input_schema"`
+	}
+	if json.Unmarshal(raw, &tools) != nil || len(tools) == 0 {
+		return ""
+	}
+	catalog := make(map[string]json.RawMessage, len(tools))
+	for _, tool := range tools {
+		if tool.Name != "" && len(tool.Schema) > 0 {
+			catalog[tool.Name] = compactSchema(tool.Schema)
+		}
+	}
+	data, err := json.Marshal(catalog)
+	if err != nil || len(catalog) == 0 {
+		return ToolRuntimeReminder
+	}
+	return "[CLIENT TOOL SCHEMAS]\nExact tool names mapped to input schemas. Full descriptions, permissions and usage constraints remain in the earlier tools context.\n" + string(data) + "\n\n" + ToolRuntimeReminder
+}
+
+func compactSchema(raw json.RawMessage) json.RawMessage {
+	var schema map[string]json.RawMessage
+	if json.Unmarshal(raw, &schema) != nil || schema == nil {
+		return raw // boolean schemas are valid too
+	}
+	for _, key := range []string{"description", "title", "$schema", "examples"} {
+		delete(schema, key)
+	}
+	// Only recurse through schema-valued keywords. Property names and literal
+	// enum/const/default data may themselves be named "description" or "title".
+	for _, key := range []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"} {
+		var entries map[string]json.RawMessage
+		if json.Unmarshal(schema[key], &entries) == nil && entries != nil {
+			for name, value := range entries {
+				entries[name] = compactSchema(value)
+			}
+			schema[key], _ = json.Marshal(entries)
+		}
+	}
+	for _, key := range []string{"items", "additionalProperties", "unevaluatedProperties", "propertyNames", "contains", "not", "if", "then", "else"} {
+		if value, ok := schema[key]; ok {
+			schema[key] = compactSchema(value)
+		}
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf", "prefixItems"} {
+		var entries []json.RawMessage
+		if json.Unmarshal(schema[key], &entries) == nil && entries != nil {
+			for i, value := range entries {
+				entries[i] = compactSchema(value)
+			}
+			schema[key], _ = json.Marshal(entries)
+		}
+	}
+	out, _ := json.Marshal(schema)
+	return out
+}
+
 // ToolsInstruction writes the prompt-side contract that tells the model
 // how to request a tool call. Both adapters emit this same text so the
 // upstream model sees one protocol regardless of which API surface the

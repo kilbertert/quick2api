@@ -2,8 +2,24 @@ package common
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func TestCompactToolsInstruction(t *testing.T) {
+	if CompactToolsInstruction(nil) != "" || CompactToolsInstruction(json.RawMessage(`[]`)) != "" {
+		t.Fatal("empty tools produced runtime instruction")
+	}
+	got := CompactToolsInstruction(json.RawMessage(`[{"name":"Bash","description":"full behavior","input_schema":{"type":"object","description":"schema docs","properties":{"description":{"type":"string","description":"field docs"},"choice":{"anyOf":[{"const":{"description":"literal"}},{"type":"integer","minimum":2}]},"data":{"additionalProperties":false}},"required":["description"]}}]`))
+	if !strings.Contains(got, `"Bash":`) || !strings.Contains(got, `"type":"tool_use"`) || strings.Contains(got, "field docs") || strings.Contains(got, "schema docs") {
+		t.Fatalf("bad catalog: %s", got)
+	}
+	for _, want := range []string{`"description":{"type":"string"}`, `"required":["description"]`, `"const":{"description":"literal"}`, `"minimum":2`, `"additionalProperties":false`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("lost schema constraint %s: %s", want, got)
+		}
+	}
+}
 
 func TestParseToolCallJSON_Bare(t *testing.T) {
 	got, ok := ParseToolCallJSON(`{"type":"tool_use","id":"x","name":"Bash","input":{"command":"ls"}}`)

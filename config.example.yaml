@@ -8,6 +8,10 @@ server:
   # 同时运行的 /v1/* 完成请求数上限；多余的请求直接 429 快速失败，
   # 不在本地排队——Quick 账号配额是共享的，排队救不了它。
   max_concurrency: 16
+  # 模型 API 请求体上限（完整历史、工具定义及编码后的附件），默认 32 MiB。
+  # 可设 1..134217728 字节；0 使用默认值。超限返回 HTTP 413，不截断历史。
+  # 内部工具结果中继使用独立的小额上限，不受此选项影响。
+  # max_request_body_bytes: 33554432
   # 单次上游回合（ws open → message_complete）的最大时长秒数。默认 600。
   # turn_timeout_seconds: 600
 
@@ -30,6 +34,9 @@ quick:
   # QUICKWORK_BUILD_STAGE 环境变量；正式装必须 prod，缺这个 agent 直接
   # RuntimeError 退出。默认 prod。
   # build_stage: "prod"
+  # 已通过 Quick UI 授权 MCP 的现有账号目录（传给自建 outpost 的 QUICKWORK_ROOT）。
+  # 空值沿用当前进程环境；不会自动切换账号，也不会创建或复制授权。
+  # profile_root: "C:/Users/<user>/.quickwork/profiles/<profile-id>"
   # 我们自建的 outpost 监听端口。0 = 自动挑空闲回环端口（推荐，
   # 上次崩溃残留的实例不会撞车）。绝对不要复用 8780——那是桌面应用
   # 自己的 outpost，它的 bearer 只活在那个应用的主进程内存里。
@@ -106,6 +113,12 @@ api:
   # api_key: "q2a-local-<随机>"
 
 tools:
+  # Anthropic 客户端工具传输。默认 prompt 兼容模式。
+  # mcp 是实验性原生桥，必须先在代理自建 outpost 正式注册 relay。
+  # 不会自动注册，也不会在失败后退回文字 JSON。见 docs/native-client-relay.md。
+  # client_transport: prompt
+  # native_relay_name: "<注册目录中的完整 quick2api_client_call 名称>"
+  # bridge_timeout_seconds: 300
   # 服务器端工具执行器。开了以后 /v1/messages 的 tool_use 不再是"建议模型
   # 怎么答"，而是真的在这台机器上执行后再把 tool_result 喂回去——多轮
   # tool-loop 由 proxy 自己跑，客户端照常收 end_turn。

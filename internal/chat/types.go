@@ -39,11 +39,23 @@ type TurnUsage struct {
 
 // TurnResult is the completed turn.
 type TurnResult struct {
-	Text           string
+	Text string
+	// ToolTextOffset marks the latest native tool boundary in Text. Quick
+	// may narrate an attachment read before using its own tools, then emit
+	// client tool JSON afterwards. Keep all text for display, but only the
+	// final uninterrupted text span is eligible for client-tool parsing.
+	ToolTextOffset int
 	FinishReason   string // "stop" | "content_filter" | "error"
 	Usage          *TurnUsage
 	ResolvedModel  string
 	PartialOnClose bool
+}
+
+func (r *TurnResult) ToolText() string {
+	if r.ToolTextOffset >= 0 && r.ToolTextOffset <= len(r.Text) {
+		return r.Text[r.ToolTextOffset:]
+	}
+	return r.Text
 }
 
 // TurnEvent is a streaming callback event.
@@ -77,23 +89,51 @@ type TurnOpts struct {
 	// keeps the tail it last sent as a shadow transcript — when this
 	// request's Tail continues that shadow, only the unsent suffix goes
 	// upstream: the stateless-API full transcript becomes a delta-append
-	// on the stateful thread. Any mismatch falls back to full Text, so a
-	// bad delta decision never does worse than today's retransmission.
+	// on the stateful thread. The bridge reseeds divergent transcripts on a
+	// fresh upstream thread rather than replaying them into the old one.
 	Tail string
-	// Final is the rendered last message of the transcript ("User: ...",
-	// "ToolResult: ..." — the operative instruction). The oversized-prompt
+	// Final is the rendered operative message and any trailing environment
+	// context ("User: ...", "ToolResult: ..."). The oversized-prompt
 	// path keeps it inline in the user_message so the model answers a real
 	// turn instead of analyzing an uploaded transcript document.
 	Final string
+	// Suffix is appended to the actual text sent for this turn, after delta
+	// selection, but is excluded from Tail's append-only watermark. This is
+	// for short per-turn protocol reminders that must stay near the operative
+	// message without forcing a full transcript resend on the next request.
+	Suffix string
 	// OnEvent is invoked synchronously from the read loop; implementations
 	// should be fast or hand off to a channel.
 	OnEvent func(TurnEvent)
+	// NativeRelay enables only the explicitly registered MCP relay on the
+	// proxy-owned outpost. It does not enable arbitrary local device execution.
+	// This local registration/courier name is not the model's callable name;
+	// Quick may expose the same relay with a device-qualified native identifier.
+	NativeRelay string
+	// NativeContinuation is supplied only after the native adapter validates a
+	// delivered, completed transcript checkpoint. The full Text remains available
+	// for cold seeding if its owned socket has expired before this new turn.
+	NativeContinuation *NativeContinuation
+	// OnNativeSession hands the adapter an idempotent discard callback for a
+	// completed socket whose final response could not be delivered downstream.
+	OnNativeSession func(discard func())
+	preparedContext *preparedContext
+}
+
+type NativeContinuation struct {
+	Text        string
+	Attachments []Attachment
 }
 
 // Attachment is one multimodal input part to ship out-of-band.
 type Attachment struct {
 	Name     string // filename shown to the model
 	MimeType string // e.g. "image/png"
+	// TranscriptOffset is the one-based byte offset of this attachment's
+	// reference in the full rendered Text. Zero means no transcript binding.
+	// A pooled delta need not upload attachments whose references were sent
+	// successfully on an earlier turn; a new connection still uploads all.
+	TranscriptOffset int
 	// Data is the raw bytes. Upload happens in sendPrompt — keep this under
 	// the ~20MB practical ceiling the attachment service accepts.
 	Data []byte

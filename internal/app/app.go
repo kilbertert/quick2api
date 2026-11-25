@@ -3,6 +3,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -35,6 +36,10 @@ func New(cfg *config.Config, b *bridge.Pool, dlog *debuglog.Logger) *App {
 	sem := make(chan struct{}, max)
 	h := &openai.Handler{Bridge: b, Cfg: cfg, Debug: dlog, Sem: sem}
 	ah := &anthropic.Handler{Bridge: b, Cfg: cfg, Debug: dlog, Sem: sem}
+	if cfg.Tools.ClientTransport == "mcp" {
+		ttl := time.Duration(cfg.Tools.BridgeTimeoutS) * time.Second
+		ah.Native = anthropic.NewNativeBridge(context.Background(), ttl, b.RunTurn)
+	}
 	if cfg.Tools.Bash.Enabled || cfg.Tools.Files.Enabled {
 		// Server-side tool executor enabled: convert the advisory
 		// "answer with tool_use JSON" contract into a real loop.
@@ -55,12 +60,22 @@ func New(cfg *config.Config, b *bridge.Pool, dlog *debuglog.Logger) *App {
 }
 
 func (a *App) routes() {
+	if a.Anthropic.Native != nil {
+		a.Mux.HandleFunc("POST /internal/client-tool-relay", a.auth(a.Anthropic.Native.Relay))
+	}
 	a.Mux.HandleFunc("POST /v1/chat/completions", a.auth(a.Handler.ChatCompletions))
 	a.Mux.HandleFunc("POST /v1/messages", a.auth(a.Anthropic.Messages))
 	a.Mux.HandleFunc("POST /v1/messages/count_tokens", a.auth(a.Anthropic.CountTokens))
 	a.Mux.HandleFunc("GET /v1/models", a.auth(a.Handler.Models))
 	a.Mux.HandleFunc("GET /healthz", a.healthz)
 	a.Mux.HandleFunc("GET /{$}", a.index)
+}
+
+// Close ends detached native jobs, including those waiting for client results.
+func (a *App) Close() {
+	if a.Anthropic.Native != nil {
+		a.Anthropic.Native.Close()
+	}
 }
 
 // auth enforces the configured bearer on /v1/*; empty api_key is pass-through.

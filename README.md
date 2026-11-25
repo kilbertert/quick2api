@@ -123,19 +123,23 @@ The knobs you're most likely to touch:
   reports `degraded` until you sign back in to the app.
 - **Thread reuse is opt-in.** Without `X-Conversation-Id` /
   `X-Session-Id` each request still opens a fresh upstream turn; send
-  one to pin the same thread across calls.
-- **Tool calls are server-side.** `tools:` in config runs a local
-  executor (`bash`/`files`) that answers `{type:"tool_use",...}` replies;
-  the upstream model never runs a tool itself. `tools.max_tool_rounds`
-  caps the loop.
+  one to reuse an append-only conversation. Divergent transcripts and
+  reconnects seed a fresh upstream thread. Requests for the same client
+  conversation are serialized.
+- **Server-side execution is optional.** `tools:` in config enables local
+  executors (`bash`/`files`); `tools.max_tool_rounds` caps their loop.
+  Quick can also run its own native tools, independently of these executors.
 - **Multi-account needs distinct outposts.** `quick.accounts` rotates
   round-robin between lanes, but real multi-account usage requires an
   outpost per account (separate Quick installs or `outpost_url`
   attachments). `max_concurrency` is per-process, so lanes still share
   CPU/memory.
-- **Client-side tool declarations are advisory unless enabled.** With
-  `tools:` off the proxy only writes the schema into the prompt and
-  parses `{type:"tool_use",...}` back — no execution.
+- **Client tools use a text contract.** In passthrough mode, schemas go in
+  the prompt and complete `{type:"tool_use",...}` replies become structured
+  API tool calls for the client to execute. This does not register native
+  Quick tools, and the upstream agent may refuse the request. See
+  [client tool compatibility](docs/client-tool-compatibility.md) for fixes,
+  validation results, and remaining limits.
 
 ## What's new in v1.1
 

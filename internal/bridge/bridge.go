@@ -33,6 +33,7 @@ type Bridge struct {
 	// past cfg.MaxPooledConns() the oldest is evicted — both bounds keep a
 	// long-running process from accumulating dead sockets.
 	conns map[string]*connEntry
+	turns conversationLocks
 	// lastUpErr keeps the most recent upstream error for /healthz so the
 	// endpoint can report degraded state instead of a bare "ok".
 	lastUpErr error
@@ -44,6 +45,8 @@ type Bridge struct {
 type connEntry struct {
 	conn   *chat.Conn
 	lastAt time.Time
+	busy   bool
+	native bool
 }
 
 // New prepares the session source. It eagerly verifies the source once so a
@@ -71,11 +74,12 @@ func New(ctx context.Context, cfg *config.Config) (*Bridge, error) {
 		slog.Info("session source: attached outpost", "url", o.URL, "ws_host", s.WSHost)
 	default:
 		o, err := session.Spawn(done, session.SpawnOpts{
-			AgentPath:  cfg.Quick.AgentPath,
-			Manifest:   cfg.Quick.Manifest,
-			BuildStage: cfg.Quick.BuildStage,
-			Port:       cfg.Quick.OutpostPort,
-			WorkDir:    "",
+			AgentPath:   cfg.Quick.AgentPath,
+			Manifest:    cfg.Quick.Manifest,
+			BuildStage:  cfg.Quick.BuildStage,
+			ProfileRoot: cfg.Quick.ProfileRoot,
+			Port:        cfg.Quick.OutpostPort,
+			WorkDir:     "",
 		})
 		if err != nil {
 			return nil, err
@@ -138,6 +142,9 @@ func (b *Bridge) sweepOnce() {
 	defer b.mu.Unlock()
 	// Idle TTL first.
 	for k, e := range b.conns {
+		if e.busy {
+			continue
+		}
 		if now.Sub(e.lastAt) > idle {
 			e.conn.Close()
 			delete(b.conns, k)
@@ -148,9 +155,15 @@ func (b *Bridge) sweepOnce() {
 		var oldestKey string
 		var oldest time.Time
 		for k, e := range b.conns {
+			if e.busy {
+				continue
+			}
 			if oldestKey == "" || e.lastAt.Before(oldest) {
 				oldestKey, oldest = k, e.lastAt
 			}
+		}
+		if oldestKey == "" {
+			break
 		}
 		e := b.conns[oldestKey]
 		e.conn.Close()
@@ -212,10 +225,18 @@ func (b *Bridge) ChatClient() *chat.Client {
 // failure refreshes the sncs-session and retries on a fresh conn.
 func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnResult, error) {
 	opts.ConversationID = normalizeConvID(opts.ConversationID)
+	release, err := b.turns.acquire(ctx, opts.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	sess, err := b.Session(false)
 	if err != nil {
 		b.noteErr(err)
 		return nil, err
+	}
+	if opts.NativeRelay != "" {
+		return b.sendNative(ctx, sess, opts)
 	}
 
 	// Session reuse: keep one live conversation per client ConversationID.
@@ -227,7 +248,13 @@ func (b *Bridge) RunTurn(ctx context.Context, opts chat.TurnOpts) (*chat.TurnRes
 		// drop it and fall through to a fresh dial.
 		b.dropConn(opts.ConversationID)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
+	// The one-shot fallback also reseeds the complete transcript. The client
+	// id must never reopen an existing upstream thread without its watermark.
+	opts.ConversationID = ""
 	res, err := b.ChatClient().RunTurn(ctx, sess, opts)
 	if err != nil {
 		var ue *chat.UpstreamError
@@ -291,7 +318,11 @@ func looksUUID(s string) bool {
 // retryable reports whether a Send failure is worth retrying on a fresh
 // connection — i.e. it died on the wire, not inside the model.
 func retryable(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var policy *chat.AttachmentPolicyError
+	if errors.As(err, &policy) {
 		return false
 	}
 	var ue *chat.UpstreamError
@@ -304,7 +335,8 @@ func retryable(err error) bool {
 func (b *Bridge) sendOnPool(ctx context.Context, sess *session.Session, opts chat.TurnOpts) (*chat.TurnResult, error) {
 	b.mu.Lock()
 	e := b.conns[opts.ConversationID]
-	if e != nil && !e.conn.Alive() {
+	if e != nil && !e.conn.CanContinue(opts) {
+		e.conn.Close()
 		delete(b.conns, opts.ConversationID)
 		e = nil
 	}
@@ -312,7 +344,10 @@ func (b *Bridge) sendOnPool(ctx context.Context, sess *session.Session, opts cha
 
 	if e == nil {
 		var err error
-		cn, err := b.ChatClient().NewConversation(ctx, sess, opts.ConversationID)
+		// The client id identifies a local transcript, not an upstream thread.
+		// A fresh connection has no watermark and must seed a fresh thread;
+		// reconnecting the old upstream id would append the entire history twice.
+		cn, err := b.ChatClient().NewConversation(ctx, sess, "")
 		if err != nil {
 			b.noteErr(err)
 			return nil, err
